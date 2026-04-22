@@ -1305,6 +1305,17 @@ class RayPPOTrainer:
         last_val_metrics = None
         self.max_steps_duration = 0
 
+        # SYB fix
+        if self.config.trainer.get("prefix_reuse", False):
+
+            from verl.utils.speculative_decoding import PreReuseManager
+
+            self.spec_rl_mgr = PreReuseManager(
+                trainer_config=self.config,
+                actor_rollout_wg=self.actor_rollout_wg,
+                tokenizer=self.tokenizer,
+            )
+
         prev_step_profile = False
         curr_step_profile = (
             self.global_steps in self.config.global_profiler.steps
@@ -1345,16 +1356,40 @@ class RayPPOTrainer:
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
                     # generate a batch
+                    # SYB fix
+                    if self.config.trainer.get("prefix_reuse", False):
+                        reuse_pre_result = self.spec_rl_mgr.pre_reuse_rl_generate_patch(
+                            gen_batch,
+                            self.async_rollout_manager,
+                            self.async_rollout_mode,
+                            self.global_steps,
+                            metrics,
+                            timing_raw,
+                        )
+                        if reuse_pre_result is not None and reuse_pre_result.have_pre_rollouts:
+                            gen_batch = reuse_pre_result.gen_batch
+                            metrics.update(reuse_pre_result.metrics)
+                    else:
+                        reuse_pre_result = None
+                    
                     with marked_timer("gen", timing_raw, color="red"):
-                        if curr_step_profile:
-                            self.async_rollout_manager.start_profile()
-                        gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
-                        self.checkpoint_manager.sleep_replicas()
-                        if curr_step_profile:
-                            self.async_rollout_manager.stop_profile()
+                        if gen_batch.batch['input_ids'].shape[0] == 0:
+                            gen_batch_output = None
+                        elif not self.async_rollout_mode:
+                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                        else:
+                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                        if gen_batch.batch['input_ids'].shape[0] != 0:
+                            timing_raw.update(gen_batch_output.meta_info["timing"])
+                            gen_batch_output.meta_info.pop("timing", None)
 
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
-                        gen_batch_output.meta_info.pop("timing", None)
+                    # SYB fix
+                    if self.config.trainer.get("prefix_reuse", False) and reuse_pre_result is not None and reuse_pre_result.have_pre_rollouts:
+                        gen_batch_output, timing_raw = self.spec_rl_mgr.pre_reuse_decoding_post_rollout(
+                            gen_batch_output,
+                            reuse_pre_result,
+                            timing_raw,
+                        )
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with marked_timer("gen_max", timing_raw, color="purple"):
@@ -1571,7 +1606,18 @@ class RayPPOTrainer:
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
-                        self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                        inputs, outputs, scores = self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+
+                        # SYB fix
+                        import pdb; pdb.set_trace()
+                        if self.config.trainer.get("prefix_reuse", False):
+                            self.spec_rl_mgr.cache.update_batch_async(
+                                prompts=inputs,
+                                responses=batch.batch["responses"],
+                                input_ids=batch.batch["prompts"],
+                                old_logps=old_log_prob.batch['old_log_probs'],
+                                 n_repeat=self.config.actor_rollout_ref.rollout.n
+                            )
 
                 # validate
                 if self.config.trainer.test_freq > 0 and (
