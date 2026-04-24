@@ -1306,11 +1306,11 @@ class RayPPOTrainer:
         self.max_steps_duration = 0
 
         # SYB fix
-        if self.config.trainer.get("prefix_reuse", False):
+        if self.config.trainer.gen_cache.get("use_gen_cache", False):
 
-            from verl.utils.speculative_decoding import PreReuseManager
+            from verl.utils.generation_reuse import GenCacheManager
 
-            self.spec_rl_mgr = PreReuseManager(
+            self.gc_mgr = GenCacheManager(
                 trainer_config=self.config,
                 actor_rollout_wg=self.actor_rollout_wg,
                 tokenizer=self.tokenizer,
@@ -1354,11 +1354,12 @@ class RayPPOTrainer:
                 )
 
                 is_last_step = self.global_steps >= self.total_training_steps
+
                 with marked_timer("step", timing_raw):
-                    # generate a batch
+
                     # SYB fix
-                    if self.config.trainer.get("prefix_reuse", False):
-                        reuse_pre_result = self.spec_rl_mgr.pre_reuse_rl_generate_patch(
+                    if self.config.trainer.gen_cache.get("use_gen_cache", False):
+                        reuse_pre_result = self.gc_mgr.reuse_generation(
                             gen_batch,
                             self.async_rollout_manager,
                             self.async_rollout_mode,
@@ -1384,12 +1385,13 @@ class RayPPOTrainer:
                             gen_batch_output.meta_info.pop("timing", None)
 
                     # SYB fix
-                    if self.config.trainer.get("prefix_reuse", False) and reuse_pre_result is not None and reuse_pre_result.have_pre_rollouts:
-                        gen_batch_output, timing_raw = self.spec_rl_mgr.pre_reuse_decoding_post_rollout(
+                    if self.config.trainer.gen_cache.get("use_gen_cache", False) and reuse_pre_result is not None and reuse_pre_result.have_pre_rollouts:
+                        gen_batch_output, timing_raw = self.gc_mgr.rebuild_generate_batch(
                             gen_batch_output,
                             reuse_pre_result,
                             timing_raw,
                         )
+
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with marked_timer("gen_max", timing_raw, color="purple"):
@@ -1609,9 +1611,9 @@ class RayPPOTrainer:
                         inputs, outputs, scores = self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                         # SYB fix
-                        import pdb; pdb.set_trace()
-                        if self.config.trainer.get("prefix_reuse", False):
-                            self.spec_rl_mgr.cache.update_batch_async(
+                        # import pdb; pdb.set_trace()
+                        if self.config.trainer.gen_cache.get("use_gen_cache", False):
+                            self.gc_mgr.cache.save_batch_async(
                                 prompts=inputs,
                                 responses=batch.batch["responses"],
                                 input_ids=batch.batch["prompts"],
