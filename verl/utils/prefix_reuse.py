@@ -41,65 +41,9 @@ def _rand_like_compat(t: torch.Tensor, seed: int | None = None):
         torch.manual_seed(seed)
         return torch.rand_like(t)
 
-@torch.no_grad()
-def spec_cut(
-    old_logp: torch.Tensor,
-    new_logp: torch.Tensor,
-    response_mask: torch.Tensor,
-    p_abs_thresh: float | None = None,
-    seed: int | None = None,
-):
-
-    assert old_logp.shape == new_logp.shape == response_mask.shape and old_logp.dim() == 2
-    B, R = new_logp.shape
-    valid = response_mask.bool()
-    resp_len = valid.sum(dim=1).to(torch.long)
-
-    # Δlogp = new - old
-    log_ratio = (new_logp - old_logp).masked_fill(~valid, 0.0)
-
-    U = _rand_like_compat(new_logp, seed=seed).clamp_min(1e-12)
-    logU = torch.log(U)
-
-    # accept condition: (Δ>=0) or (logU <= Δ)
-    accept_mask = (~valid) | (log_ratio >= 0) | (logU <= log_ratio)
-
-    # optional absolute threshold: require new_logp >= log(p_abs_thresh)
-    if p_abs_thresh is not None:
-        import math
-        log_th = math.log(p_abs_thresh)
-        accept_mask &= ((new_logp >= log_th) | (~valid))
-
-    bad = valid & (~accept_mask)
-    has_bad   = bad.any(dim=1)
-    first_bad = torch.argmax(bad.to(torch.int8), dim=1)  # no bad = 0
-    cut_idx   = torch.where(has_bad, first_bad, resp_len)
-
-    reuse_mask = (cut_idx == resp_len)
-    need_mask  = ~reuse_mask
-    idx_reuse  = torch.nonzero(reuse_mask, as_tuple=False).squeeze(-1)
-    idx_need   = torch.nonzero(need_mask,  as_tuple=False).squeeze(-1)
-    per_request_max_new_tokens = (R - cut_idx).to(torch.long)
-
-    saved_tokens = (resp_len - cut_idx).clamp(min=0)
-    metrics = {
-        "spec/skip_ratio":       reuse_mask.float().mean().item(),
-        "spec/cont_ratio":       need_mask.float().mean().item(),
-        "spec/avg_cut_idx":      cut_idx.float().mean().item(),
-        "spec/avg_resp_len":     resp_len.float().mean().item(),
-        "spec/avg_saved_tokens": saved_tokens.float().mean().item(),
-    }
-    return {
-        "cut_idx": cut_idx,
-        "resp_len": resp_len,
-        "idx_reuse": idx_reuse, "idx_need": idx_need,
-        "per_request_max_new_tokens": per_request_max_new_tokens,
-        "metrics": metrics,
-    }
-
 
 @torch.no_grad()
-def spec_cut_with_knobs(
+def compute_reuse_len_via_rejection(
     old_logp: torch.Tensor,         # [B,R]
     new_logp: torch.Tensor,         # [B,R]
     response_mask: torch.Tensor,    # [B,R] 1=valid response token
@@ -130,8 +74,9 @@ def spec_cut_with_knobs(
     has_bad   = bad.any(dim=1)
     first_bad = torch.argmax(bad.to(torch.int8), dim=1)       # Return 0 when there are no bad tokens -> 0
     cut_idx   = torch.where(has_bad, first_bad, resp_len)     # [B]
+    
+    reuse_mask = (cut_idx == resp_len) & (resp_len != 0)
 
-    reuse_mask = (cut_idx == resp_len)
     need_mask  = ~reuse_mask
     idx_reuse  = torch.nonzero(reuse_mask, as_tuple=False).squeeze(-1)
     idx_need   = torch.nonzero(need_mask,  as_tuple=False).squeeze(-1)
@@ -139,12 +84,12 @@ def spec_cut_with_knobs(
     # note: saved tokens ≈ accepted prefix = cut_idx
     saved_tokens = cut_idx.to(torch.float32)
     metrics = {
-        "spec/skip_ratio":       reuse_mask.float().mean().item(),
-        "spec/cont_ratio":       need_mask.float().mean().item(),
-        "spec/avg_cut_idx":      cut_idx.float().mean().item(),
-        "spec/avg_resp_len":     resp_len.float().mean().item(),
-        "spec/avg_saved_tokens": saved_tokens.float().mean().item(),
-        "spec/bias": float(bias), "spec/scale": float(scale),
+        "prefix/skip_ratio":       reuse_mask.float().mean().item(),
+        "prefix/cont_ratio":       need_mask.float().mean().item(),
+        "prefix/avg_cut_idx":      cut_idx.float().mean().item(),
+        "prefix/avg_resp_len":     resp_len.float().mean().item(),
+        "prefix/avg_saved_tokens": saved_tokens.float().mean().item(),
+        "prefix/bias": float(bias), "prefix/scale": float(scale),
 
     }
     return {
@@ -154,114 +99,6 @@ def spec_cut_with_knobs(
         "per_request_max_new_tokens": (R - cut_idx).to(torch.long),
         "metrics": metrics
         
-    }
-
-
-@torch.no_grad()
-def rand_reuse_cut(
-    old_logp: torch.Tensor,          # [B,R] 
-    new_logp: torch.Tensor,          # [B,R]
-    response_mask: torch.Tensor,     # [B,R]
-    *,
-    reuse_prob: float,               # ∈[0,1]
-    seed: int | None = None,
-):
-    # ---- basic shape check ----
-    assert response_mask.dim() == 2
-    B, R = response_mask.shape
-    reuse_prob = float(max(0.0, min(1.0, reuse_prob)))  # clamp to [0,1]
-
-    valid    = response_mask.bool()
-    resp_len = valid.sum(dim=1).to(torch.long)          # [B]
-
-    # ---- randomly select rows with probability reuse_prob ----
-    # only need per-row random number: reuse -> cut_idx=resp_len; otherwise -> cut_idx=0
-    # use new_logp's dtype/device to produce random number, ensure device/precision consistency
-    row_rand  = _rand_like_compat(new_logp[:, :1], seed=seed).squeeze(-1)  # [B]
-    reuse_mask = (row_rand < reuse_prob)                                    # [B] bool
-    need_mask  = ~reuse_mask
-
-    # ---- calculate cut_idx / idx_* / per_request_max_new_tokens----
-    zero_like = torch.zeros_like(resp_len)
-    cut_idx   = torch.where(reuse_mask, resp_len, zero_like)                # [B]
-
-    # ---- additional check: ensure cut_idx is in valid range ----
-    cut_idx = cut_idx.clamp(min=torch.tensor([0] * resp_len.shape[0]), max=resp_len)  # ensure cut_idx is in valid range
-
-    idx_reuse = torch.nonzero(reuse_mask, as_tuple=False).squeeze(-1)       # [Nr]
-    idx_need  = torch.nonzero(need_mask,  as_tuple=False).squeeze(-1)       # [Nn]
-    per_request_max_new_tokens = (R - cut_idx).to(torch.long)               # [B]
-
-    # ---- calculate metrics (keep spec/* names, avoid downstream changes)----
-    # "saved tokens" use the same definition as spec_cut_with_knobs: saved ≈ accepted prefix = cut_idx
-    saved_tokens = cut_idx.to(torch.float32)
-    metrics = {
-        "spec/skip_ratio":       reuse_mask.float().mean().item(),
-        "spec/cont_ratio":       need_mask.float().mean().item(),
-        "spec/avg_cut_idx":      cut_idx.float().mean().item(),
-        "spec/avg_resp_len":     resp_len.float().mean().item(),
-        "spec/avg_saved_tokens": saved_tokens.float().mean().item(),
-        "spec/random_reuse_p":   float(reuse_prob),
-    }
-
-    return {
-        "cut_idx": cut_idx,                           # [B] long
-        "resp_len": resp_len,                         # [B] long
-        "idx_reuse": idx_reuse, "idx_need": idx_need, # 1D long
-        "per_request_max_new_tokens": per_request_max_new_tokens,  # [B] long
-        "metrics": metrics,
-    }
-
-@torch.no_grad()
-def rand_reuse_all_cut(
-    old_logp: torch.Tensor,          # [B,R]
-    new_logp: torch.Tensor,          # [B,R]
-    response_mask: torch.Tensor,     # [B,R]
-    *,
-    reuse_prob: float,               # probability to randomly select truncation for all data
-    seed: int | None = None,
-):
-    # ---- basic shape check ----
-    assert response_mask.dim() == 2
-    B, R = response_mask.shape
-    reuse_prob = float(max(0.0, min(1.0, reuse_prob)))  # clamp to [0,1]
-
-    valid    = response_mask.bool()
-    resp_len = valid.sum(dim=1).to(torch.long)          # [B]
-
-    # ---- randomly select truncation point with probability reuse_prob ----
-    # use new_logp's dtype/device to produce random number, ensure device/precision consistency
-    row_rand  = _rand_like_compat(new_logp[:, :1], seed=seed).squeeze(-1)  # [B]
-    cut_idx   = torch.floor(row_rand * resp_len.to(torch.float32)).to(torch.long)  # [B]
-    
-    # ensure cut_idx is in valid range
-
-    cut_idx = cut_idx.clamp(min=torch.tensor([0] * resp_len.shape[0]), max=resp_len)  # ensure cut_idx is in valid range
-
-    # ---- calculate idx_* / per_request_max_new_tokens (align with spec_*)----
-    reuse_mask = (cut_idx == resp_len)                       # [B] bool
-    need_mask  = ~reuse_mask                                 # [B] bool
-    idx_reuse  = torch.nonzero(reuse_mask, as_tuple=False).squeeze(-1)  # [Nr]
-    idx_need   = torch.nonzero(need_mask,  as_tuple=False).squeeze(-1)  # [Nn]
-    per_request_max_new_tokens = (R - cut_idx).to(torch.long)  # [B]
-
-    # ---- calculate metrics (keep spec/* names, avoid downstream changes)----
-    saved_tokens = cut_idx.to(torch.float32)
-    metrics = {
-        "spec/skip_ratio":       reuse_mask.float().mean().item(),
-        "spec/cont_ratio":       need_mask.float().mean().item(),
-        "spec/avg_cut_idx":      cut_idx.float().mean().item(),
-        "spec/avg_resp_len":     resp_len.float().mean().item(),
-        "spec/avg_saved_tokens": saved_tokens.float().mean().item(),
-        "spec/random_reuse_all_p":   float(reuse_prob),  # new: random truncation probability
-    }
-
-    return {
-        "cut_idx": cut_idx,                           # [B] long
-        "resp_len": resp_len,                         # [B] long
-        "idx_reuse": idx_reuse, "idx_need": idx_need, # 1D long
-        "per_request_max_new_tokens": per_request_max_new_tokens,  # [B] long
-        "metrics": metrics,
     }
 
 
@@ -275,6 +112,10 @@ def build_ctx(p_ids, p_msk, p_pos,
     R    = response_ids.shape[1]
     k_vec = cut_idx.clamp(min=0, max=R)          # [N]
     max_k = int(k_vec.max().item()) if N > 0 else 0
+
+    if max_k == 0:
+        return p_ids, p_msk, p_pos
+
     ctx_len = P + max_k
 
     # calculate actual length of each prompt (right-aligned non-pad segment)
@@ -325,7 +166,7 @@ def build_ctx(p_ids, p_msk, p_pos,
     pref_pos_vals = torch.gather(pref_pos_table, 1, src_pref_col.clamp(0, max_k-1))
     ctx_pos = torch.where(pref_mask, pref_pos_vals, ctx_pos)
 
-    return ctx_ids, ctx_msk, ctx_pos, max_k
+    return ctx_ids, ctx_msk, ctx_pos
 
 
 def align_prev_to_gen(
@@ -348,19 +189,19 @@ def align_prev_to_gen(
     dummy_resp = torch.full_like(sample["response_ids"], pad_token_id)
 
     log_probs_list = []
-    response_masks_list = []
+    # response_masks_list = []
     prompts_list = []
     responses_list = []
-    position_ids_list = []
+    # position_ids_list = []
 
     # 2. 按 batch 绝对行号遍历 (0, 1, 2 ... batch_size-1)
     for idx in range(batch_size):
         if idx in cached_tensors:
             # ---- 命中：直接提取并计算 mask/pos ----
             data = cached_tensors[idx]
-            resp_ids = data["response_ids"]
-            in_ids = data["input_ids"]
-            old_logps = data["old_logps"]
+            resp_ids = data["response_ids"].unsqueeze(0)
+            in_ids = data["input_ids"].unsqueeze(0)
+            old_logps = data["old_logps"].unsqueeze(0)
 
             
         else:
@@ -368,32 +209,44 @@ def align_prev_to_gen(
             # 1. 从当前 gen_batch 取真实的 prompt
             in_ids = gen_batch.batch["input_ids"][idx].unsqueeze(0)
             
-            resp_ids = dummy_resp
-            old_logps = dummy_logp
-            
-        resp_mask = (resp_ids != pad_token_id).long()
-        combined_ids = torch.cat([in_ids, resp_ids], dim=1)
-        attn_mask = (combined_ids != pad_token_id).long()
-        pos_ids = attn_mask.cumsum(dim=1) - 1
-        pos_ids.masked_fill_(attn_mask == 0, 0)
-
+            resp_ids = dummy_resp.unsqueeze(0)
+            old_logps = dummy_logp.unsqueeze(0)
+        
         log_probs_list.append(old_logps)
-        response_masks_list.append(resp_mask)
         prompts_list.append(in_ids)
         responses_list.append(resp_ids)
-        position_ids_list.append(pos_ids)
+            
+    log_probs = torch.cat(log_probs_list, dim=0)
+    prompts = torch.cat(prompts_list, dim=0)
+    responses = torch.cat(responses_list, dim=0)
 
-    # 3. 拼接成完整的 [batch_size, seq_len] 张量
+    resp_mask = (responses != pad_token_id).long()
+    combined_ids = torch.cat([prompts, responses], dim=-1)
+    attn_mask = (combined_ids != pad_token_id).long()
+    pos_ids = attn_mask.cumsum(dim=1) * attn_mask - attn_mask
+    # import pdb; pdb.set_trace()
+
+    prompt_attn_mask = (prompts != pad_token_id).long()
+    prompt_pos_ids = prompt_attn_mask.cumsum(dim=1) * prompt_attn_mask - prompt_attn_mask
+
+    cat_attention_mask = torch.cat([prompt_attn_mask, resp_mask], dim=1)
+    
     return {
-        "log_probs": torch.cat(log_probs_list, dim=0),
-        "response_masks": torch.cat(response_masks_list, dim=0),
-        "prompts": torch.cat(prompts_list, dim=0),
-        "responses": torch.cat(responses_list, dim=0),
-        "position_ids": torch.cat(position_ids_list, dim=0),
+        "log_probs": log_probs,
+        "response_masks": resp_mask,
+        "prompts": prompts,
+        "responses": responses,
+        "position_ids": pos_ids,
+        "prompt_attn_mask": prompt_attn_mask,
+        "prompt_pos_ids": prompt_pos_ids,
+        "cat_attention_mask": cat_attention_mask,
+        "cat_input_ids": combined_ids,
     }
 
-class SpecDecodingPreRolloutResult:
-    """Container for pre-rollout speculative decoding results."""
+
+
+class ReuseRolloutResult:
+    """Container for pre-rollout reuse results."""
 
     __slots__ = (
         "gen_batch",
@@ -412,7 +265,7 @@ class SpecDecodingPreRolloutResult:
     )
 
 
-class HisReuseManager:
+class GenCacheManager:
 
     def __init__(
         self,
@@ -424,8 +277,8 @@ class HisReuseManager:
     ):
         # 配置（按你原始配置取值，这里给默认语义）
         self.n_repeat: int = trainer_config.actor_rollout_ref.rollout.n
-        self.save_rollout_dir: Optional[str] = trainer_config.trainer.get("rollout_data_dir", None)
-        self.reuse_scale = trainer_config.trainer.get("reuse_scale", 0.0)
+        self.save_path: Optional[str] = trainer_config.trainer.gen_cache.get("save_path", None)
+        self.reuse_factor = trainer_config.trainer.gen_cache.get("reuse_factor", 0.0)
         self.num_workers = trainer_config.actor_rollout_ref.rollout.agent.num_workers
 
         # 外部组件
@@ -434,29 +287,25 @@ class HisReuseManager:
         self.device = device or torch.device("cpu")
  
         # hash index  
-        self.cache = SimpleFileCache(base_dir=trainer_config.trainer.get("rollout_data_dir", "./his_data"), chunk_size=1000)  
-
-        # 状态：历史轮转（你原来的 latest_old_policy / latest_old_policy_tensor）
-        self.latest_old_policy = defaultdict(list)
-        self.latest_old_policy_tensor = defaultdict(list)
-
+        self.chunk_size = trainer_config.trainer.gen_cache.get("chunk_size", 1000)
+        self.cache = HashFileCache(save_path=self.save_path, chunk_size=trainer_config.trainer.gen_cache.get("chunk_size", 1000))  
         # 确保目录存在（如果需要落盘）
-        if self.save_rollout_dir:
-            os.makedirs(self.save_rollout_dir, exist_ok=True)
+        if self.save_path:
+            os.makedirs(self.save_path, exist_ok=True)
 
 
-    def pre_reuse_rl_generate_patch(self, 
+    def reuse_generation(self, 
         gen_batch: DataProto,
         async_rollout_manager: Any,
         async_rollout_mode: Any,
         global_steps: Any,       
         metrics: dict, 
         timing_raw: dict,
-    ) -> Optional[SpecDecodingPreRolloutResult]:
+    ) -> Optional[ReuseRolloutResult]:
 
-        result = SpecDecodingPreRolloutResult()
+        result = ReuseRolloutResult()
 
-        print(f"Begin Speculative Decoding...")
+        print(f"Begin History Generation Reuse...")
         
         from verl.utils.debug import marked_timer
 
@@ -479,72 +328,46 @@ class HisReuseManager:
             aligned_old_logp = aligned["log_probs"]
             aligned_old_response_mask = aligned['response_masks']
             prompt_ids = aligned["prompts"]
-            prompt_attn_mask = (prompt_ids != 151643).long()
-            prompt_pos_ids = prompt_attn_mask.cumsum(dim=1) * prompt_attn_mask - prompt_attn_mask
-            
             aligned_old_responses = aligned["responses"]
             aligned_position_ids = aligned["position_ids"]
+            prompt_attn_mask = aligned["prompt_attn_mask"]
+            prompt_pos_ids = aligned["prompt_pos_ids"]
+            cat_attention_mask = aligned["cat_attention_mask"]
+            cat_input_ids = aligned["cat_input_ids"]            
 
             if self.tokenizer.pad_token is None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-
-            # prompt_ids = gen_batch.batch["input_ids"]  # [B,P]
-            # prompt_attn_mask = gen_batch.batch["attention_mask"]  # [B,P]
-            # prompt_pos_ids = gen_batch.batch["position_ids"]
-            gen_batch.batch["input_ids"] = prompt_ids
-            gen_batch.batch["attention_mask"] = prompt_attn_mask
-            gen_batch.batch["position_ids"] = prompt_pos_ids
-
-            attention_mask = torch.cat([prompt_attn_mask, aligned_old_response_mask], dim=1)
-            input_ids = torch.cat([prompt_ids, aligned_old_responses], dim=-1)
-            # import pdb; pdb.set_trace()
-            
+                self.tokenizer.pad_token = self.tokenizer.eos_token            
         
             pre_prob_data = DataProto.from_single_dict({
                 "responses": aligned_old_responses,
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
+                "input_ids": cat_input_ids,
+                "attention_mask": cat_attention_mask,
                 "position_ids": aligned_position_ids
             })
             pre_log_probs = self.actor_rollout_wg.compute_log_prob(pre_prob_data)
-            old_logp = aligned_old_logp
             new_logp = pre_log_probs.batch['old_log_probs']
-            # import pdb; pdb.set_trace()
-            response_mask = aligned_old_response_mask
 
-            if self.reuse_scale == 0.0:
-                out = spec_cut(
-                    old_logp=old_logp,
-                    new_logp=new_logp,
-                    response_mask=response_mask,
-                    p_abs_thresh=None,
-                    seed=1234,
-                )
-            else:
-                print("=======enter spec_cut_with_knobs======")
-                out = spec_cut_with_knobs(
-                    old_logp=old_logp,
-                    new_logp=new_logp,
-                    response_mask=response_mask,
-                    bias=self.reuse_scale if self.reuse_scale < 0 else -self.reuse_scale,
-                    p_abs_thresh=None,
-                    seed=1234,
-                )
+            print("=======enter compute_reuse_len_via_rejection======")
+            out = compute_reuse_len_via_rejection(
+                old_logp=aligned_old_logp,
+                new_logp=new_logp,
+                response_mask=aligned_old_response_mask,
+                bias=self.reuse_factor if self.reuse_factor < 0 else -self.reuse_factor,
+                p_abs_thresh=None,
+                seed=1234,
+            )
 
             cut_idx = out["cut_idx"]  # [B]
             idx_reuse = out["idx_reuse"]  # [Nr]
             idx_need = out["idx_need"]  # [Nn]
 
-            rows = idx_need
-            p_ids = gen_batch.batch["input_ids"][rows]
-            p_msk = gen_batch.batch["attention_mask"][rows]
-            # import pdb; pdb.set_trace()
-            p_pos = gen_batch.batch["position_ids"][rows]
-            ctx_ids, ctx_msk, ctx_pos, max_k = build_ctx(
-                p_ids, p_msk, p_pos,
-                aligned_old_responses[rows],
-                cut_idx[rows],
-                pad_id=tokenizer.pad_token_id,
+            ctx_ids, ctx_msk, ctx_pos = build_ctx(
+                prompt_ids[idx_need],
+                prompt_attn_mask[idx_need], 
+                prompt_pos_ids[idx_need],
+                aligned_old_responses[idx_need],
+                cut_idx[idx_need],
+                pad_id=self.tokenizer.pad_token_id,
             )
 
             need_dp = DataProto.from_single_dict({
@@ -556,11 +379,10 @@ class HisReuseManager:
             
             per_req_np = out["per_request_max_new_tokens"][idx_need.cpu()].detach().cpu().numpy().astype(np.int32)
 
-            # need_dp.meta_info["per_request_max_new_tokens"] = per_req
             need_dp.non_tensor_batch["per_request_max_new_tokens"] = per_req_np
-            need_dp.non_tensor_batch["raw_prompt"] = gen_batch.non_tensor_batch["raw_prompt"][rows.cpu().numpy()]
-            need_dp.non_tensor_batch["data_source"] = gen_batch.non_tensor_batch["data_source"][rows.cpu().numpy()]
-            need_dp.non_tensor_batch["reward_model"] = gen_batch.non_tensor_batch["reward_model"][rows.cpu().numpy()]
+            need_dp.non_tensor_batch["raw_prompt"] = gen_batch.non_tensor_batch["raw_prompt"][idx_need.cpu().numpy()]
+            need_dp.non_tensor_batch["data_source"] = gen_batch.non_tensor_batch["data_source"][idx_need.cpu().numpy()]
+            need_dp.non_tensor_batch["reward_model"] = gen_batch.non_tensor_batch["reward_model"][idx_need.cpu().numpy()]
             need_dp.meta_info["prefix_reuse"] = True
 
             # === Pad to DP world_size multiple ===
@@ -569,7 +391,7 @@ class HisReuseManager:
                 if not async_rollout_mode
                 else self.num_workers
             )
-
+            
             if idx_need.shape[0] > 0:
                 need_dp_padded, pad_size = pad_dataproto_to_divisor(need_dp, size_divisor)
                 gen_batch = need_dp_padded
@@ -590,12 +412,11 @@ class HisReuseManager:
         result.idx_need = idx_need
 
         return result
-
-
-    def pre_reuse_decoding_post_rollout(
+        
+    def rebuild_generate_batch(
         self,
         gen_batch_output: DataProto,
-        pre_result: SpecDecodingPreRolloutResult,
+        pre_result: ReuseRolloutResult,
         timing_raw: dict,
     ) -> DataProto:       
         
@@ -707,13 +528,13 @@ class HisReuseManager:
 
 
 
-class SimpleFileCache:
+class HashFileCache:
     """
     极简哈希文件缓存：无索引、无淘汰、直接覆盖。
     目录结构: his_data/ab/cd/abcd1234...ef.pt
     """
-    def __init__(self, base_dir: str = "./his_data", chunk_size: int = 1000):
-        self.base_dir = base_dir
+    def __init__(self, save_path: str = "./his_data", chunk_size: int = 1000):
+        self.save_path = save_path
         self.chunk_size = chunk_size
         # 启动时不需要做任何事情，没有 index 要读，没有文件要扫
         
@@ -728,7 +549,11 @@ class SimpleFileCache:
         取前 8 位十六进制 (32位整数) 对 chunk_size 取模，保证绝对均匀打散。
         """
         chunk_id = int(h[:8], 16) % self.chunk_size
-        return os.path.join(self.base_dir, f"chunk_{chunk_id}", f"{h}.pt")
+
+        group_size = 101  
+        group_id = chunk_id // group_size
+
+        return os.path.join(self.save_path, f"chunk_{group_id}", f"{h}.pt")
 
     # ==============================================================
     # 1. 查询：直接拼路径，exists 判断，load 读取
@@ -742,8 +567,9 @@ class SimpleFileCache:
         num_unique_prompts = len(prompts) // n_repeat
         
         for i in range(num_unique_prompts):
-            h = self._hash(prompts[i * n_repeat])
+            h = self._hash(prompts[i * n_repeat][0]['content'])
             pt_path = self._get_path(h)
+            # import pdb; pdb.set_trace()
             
             if os.path.exists(pt_path):
                 try:
@@ -761,10 +587,8 @@ class SimpleFileCache:
                     pass
         return results
 
-    # ==============================================================
-    # 2. 写入：扔进队列，后台直接覆盖写
-    # ==============================================================
-    def update_batch_async(
+
+    def save_batch_async(
         self,
         prompts: List[str],
         responses: torch.Tensor,
@@ -772,30 +596,15 @@ class SimpleFileCache:
         old_logps: torch.Tensor,
         n_repeat: int = 1,  # 新增参数
     ):
-        batch_size = len(prompts)
-        if batch_size == 0:
-            return
-            
-        num_unique_prompts = batch_size // n_repeat
-        
-        for i in range(num_unique_prompts):
-
-            prompt_str = prompts[i * n_repeat]
-
-            grouped_data_list = []
-            for j in range(n_repeat):
-                idx = i * n_repeat + j
-                grouped_data_list.append({
-                    "response_ids": responses[idx].detach().cpu(),
-                    "input_ids": input_ids[idx].detach().cpu(),
-                    "old_logps": old_logps[idx].detach().cpu(),
-                })
                 
             # 作为一个整体 item 扔进队列
-            self._queue.put({
-                "prompt_str": prompt_str,
-                "grouped_data_list": grouped_data_list
-            })
+        self._queue.put({
+            "prompts": prompts,
+            "responses": responses.detach().cpu(),
+            "input_ids": input_ids.detach().cpu(),
+            "old_logps": old_logps.detach().cpu(),
+            "n_repeat": n_repeat
+        })
 
     # ==============================================================
     # 内部机制
@@ -803,18 +612,41 @@ class SimpleFileCache:
     def _write_worker(self):
         while True:
             item = self._queue.get()
+
             if item is None:
                 break
+            
+            prompts = item["prompts"]
+            responses = item["responses"]
+            input_ids = item["input_ids"]
+            old_logps = item["old_logps"]
+            n_repeat = item["n_repeat"]
+            
+            batch_size = len(prompts)
 
-            h = self._hash(item["prompt_str"])
-            pt_path = self._get_path(h)
+            if batch_size == 0:
+                return
+                
+            num_unique_prompts = batch_size // n_repeat
             
-            # 2. 直接拿到 CPU 数据 (它本身就是我们需要存入的 List 格式)
-            data_list_to_save = item["grouped_data_list"]
-            
-            # 3. 创建目录并落盘
-            os.makedirs(os.path.dirname(pt_path), exist_ok=True)
-            torch.save(data_list_to_save, pt_path)
+            for i in range(num_unique_prompts):
+
+                prompt_str = prompts[i * n_repeat].removeprefix("user\n").removesuffix("\nassistant\n")
+                prompt_str = prompt_str.removeprefix("user\n").removesuffix("\nassistant\n")
+                grouped_data_list = []
+                for j in range(n_repeat):
+                    idx = i * n_repeat + j
+                    grouped_data_list.append({
+                        "response_ids": responses[idx],
+                        "input_ids": input_ids[idx],
+                        "old_logps": old_logps[idx],
+                    })
+
+                h = self._hash(prompt_str)
+                pt_path = self._get_path(h)
+                # import pdb; pdb.set_trace()
+                os.makedirs(os.path.dirname(pt_path), exist_ok=True)
+                torch.save(grouped_data_list, pt_path)
             
         self._queue.task_done()
 
